@@ -22,7 +22,7 @@ struct Opt {
     #[clap(short = 'a', long = "addr", default_value = "0.0.0.0")]
     addr: String,
     /// set the listen port
-    #[clap(short = 'p', long = "port", default_value = "8080")]
+    #[clap(short = 'p', long = "port", default_value = "5050")]
     port: u16,
 }
 

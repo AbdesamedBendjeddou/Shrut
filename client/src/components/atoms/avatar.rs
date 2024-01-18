@@ -1,21 +1,20 @@
-use gloo::{
-    console::log,
-    file::callbacks::{read_as_array_buffer, read_as_bytes},
-    utils::format::JsValueSerdeExt,
-};
+use gloo::{console::log, events::EventListener};
 use js_sys::{Array, ArrayBuffer, Uint8Array};
-use std::{cell::Cell, rc::Rc, thread::sleep, time::Duration};
-use wasm_bindgen::prelude::*;
+use std::{
+    cell::{Cell, RefCell},
+    collections::VecDeque,
+    rc::Rc,
+};
 
 use serde::{Deserialize, Serialize};
 use stylist::css;
 use tokio::sync::broadcast::Sender;
 use uuid::Uuid;
-use wasm_bindgen::{prelude::Closure, JsCast, JsValue};
-use web_sys::{File, FileList, FilePropertyBag, FileReader, HtmlInputElement};
+use wasm_bindgen::{prelude::Closure, JsCast};
+use web_sys::{File, FileList, HtmlInputElement, RtcDataChannel};
 use yew::prelude::*;
 
-use crate::webrtc_manager::WebRtcConnection;
+use crate::webrtc_manager::{WebRtcConnection, MAX_CHUNK_SIZE};
 
 use super::{messages::AppMessage, other_peers_state::WebRTCRole};
 
@@ -121,12 +120,12 @@ pub fn Avatar(props: &OtherPeer) -> Html {
         //let file = event.data_transfer().unwrap().files().unwrap();
     });
 
-    let webrtc_connection_clone = webrtc_connection.clone();
+    let data_channel = webrtc_connection.data_channel.clone();
     let onchange = Callback::from(move |event: Event| {
         log!("on change");
         let input: HtmlInputElement = event.target_unchecked_into();
         let files = upload_files(input.files());
-        send_files(&*webrtc_connection_clone, files);
+        send_files(data_channel.clone(), files);
     });
 
     html! {
@@ -162,46 +161,109 @@ fn upload_files(files: Option<FileList>) -> Vec<File> {
     uploaded_files
 }
 
-
-fn send_files(webrtc_connection: &WebRtcConnection, files: Vec<File>) {
+fn send_files(data_channel: RtcDataChannel, files: Vec<File>) {
     for file in files {
-        send_file(webrtc_connection, file)
+        read_as_array_buffer_then_send(data_channel.clone(), file)
     }
 }
-
-fn send_file(webrtc_connection: &WebRtcConnection, file: File /*FileData*/) {
+fn read_as_array_buffer_then_send(data_channel: RtcDataChannel, file: File) {
     log!("sending file");
     log!(format!("{}", file.size()));
 
-    let file_ = file.clone();
-    let name = file.name();
-    let data_channel = webrtc_connection.data_channel.clone();
-    
-    let file_clone = file.clone();
     let file_reader = web_sys::FileReader::new().unwrap();
     let file_reader_clone = file_reader.clone();
     let onloadend_cb = Closure::<dyn FnMut(_)>::new(move |_e: web_sys::ProgressEvent| {
         let file = file_reader_clone.result().unwrap();
-        let arraybuff = js_sys::ArrayBuffer::from(file);
-        log!(arraybuff.byte_length());
-
-        //slicing
-        //let chunks = array.slice(begin);
-
-        //for chunk in chunks {
-        //    data_channel.send_with_array_buffer(&chunks).expect("err data channel");
-        //}
-
-        let array = Array::from(&arraybuff);
-        log!(array.length()); // length = 0
-        let file = File::new_with_buffer_source_sequence(&array, &name).unwrap();
-        log!(file.size()); // size = 0
+        let array_buffer: ArrayBuffer = file.unchecked_into();
+        send_as_array_buffer(data_channel.clone(), array_buffer);
     });
+
     file_reader.set_onloadend(Some(onloadend_cb.as_ref().unchecked_ref()));
     file_reader
-        .read_as_array_buffer(&file_)
+        .read_as_array_buffer(&file)
         .expect("blob not readable");
     onloadend_cb.forget();
 }
 
+fn send_as_array_buffer(data_channel: RtcDataChannel, array_buffer: ArrayBuffer) {
+    /*
+    let data_channel = webrtc_connection.data_channel.clone();
+    {
+        let data_channel_ = data_channel.clone();
+        let queue = queue.clone();
+        let bytes_sent = bytes_sent.clone();
+        let onbuff_amount_low = Closure::wrap(Box::new(move |_| {
+            send_till_buffer_full(data_channel_.clone(), queue.clone(), bytes_sent.clone());
+        }) as Box<dyn FnMut(Event)>);
+            data_channel.set_onbufferedamountlow(Some(onbuff_amount_low.as_ref().unchecked_ref()));
+            onbuff_amount_low.forget();
+        }
+        */
+    let bytes_sent = Rc::new(Cell::new(0));
+    let queue = Rc::new(RefCell::new(VecDeque::new()));
+    set_onbufferedamountlow(data_channel.clone(), queue.clone(), bytes_sent.clone());
 
+    let array_length = array_buffer.byte_length();
+    let numb_of_slices = (array_length / MAX_CHUNK_SIZE) + 1;
+    let mut begin = 0;
+    for _ in 0..numb_of_slices {
+        let chunk = array_buffer.slice_with_end(begin, begin + MAX_CHUNK_SIZE);
+        log!(chunk.byte_length());
+        queue.borrow_mut().push_back(chunk);
+        send_till_buffer_full(data_channel.clone(), queue.clone(), bytes_sent.clone());
+        begin += MAX_CHUNK_SIZE;
+    }
+}
+
+fn set_onbufferedamountlow(
+    data_channel: RtcDataChannel,
+    queue: Rc<RefCell<VecDeque<ArrayBuffer>>>,
+    bytes_sent: Rc<Cell<u32>>,
+) {
+    let data_channel_ = data_channel.clone();
+    let onbuff_amount_low_cb = Closure::wrap(Box::new(move |_| {
+        send_till_buffer_full(data_channel_.clone(), queue.clone(), bytes_sent.clone());
+    }) as Box<dyn FnMut(Event)>);
+    data_channel.set_onbufferedamountlow(Some(onbuff_amount_low_cb.as_ref().unchecked_ref()));
+    onbuff_amount_low_cb.forget();
+}
+
+pub fn send_till_buffer_full(
+    data_channel: RtcDataChannel,
+    queue: Rc<RefCell<VecDeque<ArrayBuffer>>>,
+    bytes_sent: Rc<Cell<u32>>,
+) {
+    loop {
+        let chunk = queue.borrow_mut().pop_front();
+        if let Some(chunk) = chunk {
+            let res = data_channel.send_with_array_buffer(&chunk);
+            if res.is_err() {
+                queue.borrow_mut().push_front(chunk);
+                break;
+            }
+            bytes_sent.set(bytes_sent.get() + MAX_CHUNK_SIZE);
+            log!("bytes sent: ", bytes_sent.get());
+        } else {
+            break;
+        }
+    }
+}
+
+/*  //let len = queue.borrow().len();
+for _ in  0..queue.borrow().len() {
+    log!("buff ammount", data_channel.buffered_amount());
+    //if data_channel.buffered_amount() < data_channel.buffered_amount_low_threshold() {
+       // log!("buff is less");
+       // if err {continue;}
+//slicing
+//let chunks = array.slice(begin);
+
+//for chunk in chunks {
+//}
+
+let array = Array::of1(&arraybuff);
+
+log!(array.length()); // length = 0
+let file = File::new_with_buffer_source_sequence(&array, &name).unwrap();
+log!(file.size()); // size = 0
+log!(file.type_()); */

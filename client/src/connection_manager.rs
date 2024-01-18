@@ -23,7 +23,7 @@ pub fn connection_manager(
     this_peer: Dispatch<ThisPeer>,
     tx: Sender<AppMessage>,
 ) {
-    let ws = WebSocket::open("ws://192.168.1.5:8080/ws").unwrap();
+    let ws = WebSocket::open("ws://127.0.0.1:5050/ws").unwrap();
     let (sender, receiver) = futures::StreamExt::split(ws);
     dispatcher(receiver, tx.clone(), other_peers, this_peer);
     send(sender, tx.clone());
